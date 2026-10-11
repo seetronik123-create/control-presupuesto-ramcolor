@@ -1,132 +1,169 @@
 const express = require('express');
-const sqlite3 = require('sqlite3').verbose();
+const { createClient } = require('@libsql/client');
 const path = require('path');
 
 const app = express();
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 
 app.use(express.json({ limit: '15mb' }));
 app.use(express.urlencoded({ extended: true, limit: '15mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Conexión a SQLite
-const db = new sqlite3.Database('./presupuestos.db', (err) => {
-    if (err) {
-        console.error('Error al abrir la base de datos', err.message);
-    } else {
-        console.log('Conectado a la base de datos SQLite.');
+// Conexión a Turso (Base de datos en la nube)
+const db = createClient({
+    url: process.env.TURSO_DATABASE_URL,
+    authToken: process.env.TURSO_AUTH_TOKEN,
+});
+
+// Inicializar tablas en Turso de forma automática
+async function initDatabase() {
+    try {
+        await db.execute(`CREATE TABLE IF NOT EXISTS proyectos (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            nombre_cliente TEXT,
+            cotizacion_n TEXT,
+            valor_total REAL,
+            pdf_data TEXT,
+            pdf_nombre TEXT
+        )`);
+
+        await db.execute(`CREATE TABLE IF NOT EXISTS movimientos (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            proyecto_id INTEGER,
+            tipo TEXT, 
+            descripcion TEXT,
+            monto REAL,
+            fecha TEXT,
+            FOREIGN KEY(proyecto_id) REFERENCES proyectos(id) ON DELETE CASCADE
+        )`);
+        console.log("Tablas de Turso inicializadas correctamente.");
+    } catch (err) {
+        console.error("Error al inicializar la base de datos en Turso:", err.message);
+    }
+}
+
+initDatabase();
+
+// API: Obtener todos los proyectos
+app.get('/api/proyectos', async (req, res) => {
+    try {
+        const result = await db.execute('SELECT id, nombre_cliente, cotizacion_n, valor_total, pdf_nombre FROM proyectos ORDER BY id DESC');
+        res.json(result.rows);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
     }
 });
 
-// Crear tablas con soporte para guardar el PDF en formato base64/texto
-db.serialize(() => {
-    db.run(`CREATE TABLE IF NOT EXISTS proyectos (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        nombre_cliente TEXT,
-        cotizacion_n TEXT,
-        valor_total REAL,
-        pdf_data TEXT,
-        pdf_nombre TEXT
-    )`);
-
-    db.run(`CREATE TABLE IF NOT EXISTS movimientos (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        proyecto_id INTEGER,
-        tipo TEXT, 
-        descripcion TEXT,
-        monto REAL,
-        fecha TEXT,
-        FOREIGN KEY(proyecto_id) REFERENCES proyectos(id) ON DELETE CASCADE
-    )`);
-});
-
-// API: Obtener todos los proyectos
-app.get('/api/proyectos', (req, res) => {
-    db.all('SELECT id, nombre_cliente, cotizacion_n, valor_total, pdf_nombre FROM proyectos ORDER BY id DESC', [], (err, rows) => {
-        if (err) return res.status(500).json({ error: err.message });
-        res.json(rows);
-    });
-});
-
 // API: Crear nueva cotización con PDF opcional
-app.post('/api/proyectos', (req, res) => {
-    const { nombre_cliente, cotizacion_n, valor_total, pdf_data, pdf_nombre } = req.body;
-    
-    const cliente = nombre_cliente || "Cliente General";
-    const cotizacionN = cotizacion_n || "1";
-    const valorTotal = parseFloat(valor_total) || 0;
+app.post('/api/proyectos', async (req, res) => {
+    try {
+        const { nombre_cliente, cotizacion_n, valor_total, pdf_data, pdf_nombre } = req.body;
+        
+        const cliente = nombre_cliente || "Cliente General";
+        const cotizacionN = cotizacion_n || "1";
+        const valorTotal = parseFloat(valor_total) || 0;
 
-    db.run('INSERT INTO proyectos (nombre_cliente, cotizacion_n, valor_total, pdf_data, pdf_nombre) VALUES (?, ?, ?, ?, ?)',
-        [cliente, cotizacionN, valorTotal, pdf_data || null, pdf_nombre || null], function(err) {
-            if (err) return res.status(500).json({ error: err.message });
-            res.json({ 
-                id: this.lastID, 
-                mensaje: 'Cotización creada con éxito'
-            });
+        const result = await db.execute({
+            sql: 'INSERT INTO proyectos (nombre_cliente, cotizacion_n, valor_total, pdf_data, pdf_nombre) VALUES (?, ?, ?, ?, ?)',
+            args: [cliente, cotizacionN, valorTotal, pdf_data || null, pdf_nombre || null]
         });
+
+        res.json({ 
+            id: Number(result.lastInsertRowid), 
+            mensaje: 'Cotización creada con éxito'
+        });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
 });
 
-// API: Eliminar cotización completa
-app.delete('/api/proyectos/:id', (req, res) => {
-    const proyectoId = req.params.id;
-    db.serialize(() => {
-        db.run('DELETE FROM movimientos WHERE proyecto_id = ?', [proyectoId]);
-        db.run('DELETE FROM proyectos WHERE id = ?', [proyectoId], function(err) {
-            if (err) return res.status(500).json({ error: err.message });
+// API: Eliminar cotización completa (con transacción)
+app.delete('/api/proyectos/:id', async (req, res) => {
+    try {
+        const proyectoId = req.params.id;
+        const tx = await db.transaction('write');
+        try {
+            await tx.execute({ sql: 'DELETE FROM movimientos WHERE proyecto_id = ?', args: [proyectoId] });
+            await tx.execute({ sql: 'DELETE FROM proyectos WHERE id = ?', args: [proyectoId] });
+            await tx.commit();
             res.json({ mensaje: 'Cotización eliminada correctamente' });
-        });
-    });
+        } catch (txErr) {
+            await tx.rollback();
+            throw txErr;
+        }
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
 });
 
 // API: Obtener resumen financiero y PDF de una cotización
-app.get('/api/proyecto/:id', (req, res) => {
-    const proyectoId = req.params.id;
+app.get('/api/proyecto/:id', async (req, res) => {
+    try {
+        const proyectoId = req.params.id;
 
-    db.get('SELECT id, nombre_cliente, cotizacion_n, valor_total, pdf_nombre, CASE WHEN pdf_data IS NOT NULL THEN 1 ELSE 0 END as tiene_pdf FROM proyectos WHERE id = ?', [proyectoId], (err, proyecto) => {
-        if (err || !proyecto) return res.status(404).json({ error: 'Proyecto no encontrado' });
-
-        db.all('SELECT * FROM movimientos WHERE proyecto_id = ?', [proyectoId], (err, movimientos) => {
-            if (err) return res.status(500).json({ error: err.message });
-
-            let totalAdelantos = 0, totalMateriales = 0, totalTrabajadores = 0, totalOperativos = 0;
-            movimientos.forEach(m => {
-                if (m.tipo === 'adelanto') totalAdelantos += m.monto;
-                if (m.tipo === 'material') totalMateriales += m.monto;
-                if (m.tipo === 'trabajador') totalTrabajadores += m.monto;
-                if (m.tipo === 'operativo') totalOperativos += m.monto;
-            });
-
-            const totalGastos = totalMateriales + totalTrabajadores + totalOperativos;
-            const gananciaNeta = proyecto.valor_total - totalGastos;
-            const saldoPendienteCobrar = proyecto.valor_total - totalAdelantos;
-            const margenRentabilidad = proyecto.valor_total > 0 ? (gananciaNeta / proyecto.valor_total) * 100 : 0;
-
-            res.json({
-                proyecto,
-                movimientos,
-                resumen: {
-                    valorTotal: proyecto.valor_total,
-                    totalAdelantos,
-                    saldoPendienteCobrar,
-                    totalMateriales,
-                    totalTrabajadores,
-                    totalOperativos,
-                    totalGastos,
-                    gananciaNeta,
-                    margenRentabilidad: margenRentabilidad.toFixed(2)
-                }
-            });
+        const proyectoRes = await db.execute({
+            sql: 'SELECT id, nombre_cliente, cotizacion_n, valor_total, pdf_nombre, CASE WHEN pdf_data IS NOT NULL THEN 1 ELSE 0 END as tiene_pdf FROM proyectos WHERE id = ?',
+            args: [proyectoId]
         });
-    });
+
+        if (proyectoRes.rows.length === 0) {
+            return res.status(404).json({ error: 'Proyecto no encontrado' });
+        }
+        const proyecto = proyectoRes.rows[0];
+
+        const movRes = await db.execute({
+            sql: 'SELECT * FROM movimientos WHERE proyecto_id = ?',
+            args: [proyectoId]
+        });
+        const movimientos = movRes.rows;
+
+        let totalAdelantos = 0, totalMateriales = 0, totalTrabajadores = 0, totalOperativos = 0;
+        movimientos.forEach(m => {
+            if (m.tipo === 'adelanto') totalAdelantos += m.monto;
+            if (m.tipo === 'material') totalMateriales += m.monto;
+            if (m.tipo === 'trabajador') totalTrabajadores += m.monto;
+            if (m.tipo === 'operativo') totalOperativos += m.monto;
+        });
+
+        const totalGastos = totalMateriales + totalTrabajadores + totalOperativos;
+        const gananciaNeta = proyecto.valor_total - totalGastos;
+        const saldoPendienteCobrar = proyecto.valor_total - totalAdelantos;
+        const margenRentabilidad = proyecto.valor_total > 0 ? (gananciaNeta / proyecto.valor_total) * 100 : 0;
+
+        res.json({
+            proyecto,
+            movimientos,
+            resumen: {
+                valorTotal: proyecto.valor_total,
+                totalAdelantos,
+                saldoPendienteCobrar,
+                totalMateriales,
+                totalTrabajadores,
+                totalOperativos,
+                totalGastos,
+                gananciaNeta,
+                margenRentabilidad: margenRentabilidad.toFixed(2)
+            }
+        });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
 });
 
 // API: Descargar el PDF guardado de la cotización
-app.get('/api/proyecto/:id/pdf', (req, res) => {
-    const proyectoId = req.params.id;
-    db.get('SELECT pdf_data, pdf_nombre FROM proyectos WHERE id = ?', [proyectoId], (err, row) => {
-        if (err || !row || !row.pdf_data) {
+app.get('/api/proyecto/:id/pdf', async (req, res) => {
+    try {
+        const proyectoId = req.params.id;
+        const result = await db.execute({
+            sql: 'SELECT pdf_data, pdf_nombre FROM proyectos WHERE id = ?',
+            args: [proyectoId]
+        });
+
+        if (result.rows.length === 0 || !result.rows[0].pdf_data) {
             return res.status(404).send('PDF no encontrado para este proyecto.');
         }
+        const row = result.rows[0];
+
         const matches = row.pdf_data.match(/^data:([A-Za-z-+\/]+);base64,(.+)$/);
         let buffer;
         if (matches && matches.length === 3) {
@@ -138,30 +175,42 @@ app.get('/api/proyecto/:id/pdf', (req, res) => {
         res.setHeader('Content-Type', 'application/pdf');
         res.setHeader('Content-Disposition', `inline; filename="${row.pdf_nombre || 'cotizacion.pdf'}"`);
         res.send(buffer);
-    });
+    } catch (err) {
+        res.status(500).send('Error al procesar el PDF');
+    }
 });
 
 // API: Registrar movimiento
-app.post('/api/movimientos', (req, res) => {
-    const { proyecto_id, tipo, descripcion, monto } = req.body;
-    const fecha = new Date().toISOString().split('T')[0];
+app.post('/api/movimientos', async (req, res) => {
+    try {
+        const { proyecto_id, tipo, descripcion, monto } = req.body;
+        const fecha = new Date().toISOString().split('T')[0];
 
-    db.run('INSERT INTO movimientos (proyecto_id, tipo, descripcion, monto, fecha) VALUES (?, ?, ?, ?, ?)',
-        [proyecto_id, tipo, descripcion, monto, fecha], function(err) {
-            if (err) return res.status(500).json({ error: err.message });
-            res.json({ id: this.lastID, mensaje: 'Movimiento registrado con éxito' });
+        const result = await db.execute({
+            sql: 'INSERT INTO movimientos (proyecto_id, tipo, descripcion, monto, fecha) VALUES (?, ?, ?, ?, ?)',
+            args: [proyecto_id, tipo, descripcion, monto, fecha]
         });
+
+        res.json({ id: Number(result.lastInsertRowid), mensaje: 'Movimiento registrado con éxito' });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
 });
 
 // API: Eliminar movimiento
-app.delete('/api/movimientos/:id', (req, res) => {
-    const movId = req.params.id;
-    db.run('DELETE FROM movimientos WHERE id = ?', [movId], function(err) {
-        if (err) return res.status(500).json({ error: err.message });
+app.delete('/api/movimientos/:id', async (req, res) => {
+    try {
+        const movId = req.params.id;
+        await db.execute({
+            sql: 'DELETE FROM movimientos WHERE id = ?',
+            args: [movId]
+        });
         res.json({ mensaje: 'Movimiento eliminado correctamente' });
-    });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
 });
 
 app.listen(PORT, () => {
-    console.log(`Servidor corriendo en http://localhost:${PORT}`);
+    console.log(`Servidor corriendo en el puerto ${PORT}`);
 });
